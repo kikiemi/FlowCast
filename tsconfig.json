@@ -1,0 +1,27 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "node",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "forceConsistentCasingInFileNames": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "noFallthroughCasesInSwitch": true,
+        "outDir": "./dist",
+        "declaration": true,
+        "lib": [
+            "ES2022",
+            "DOM",
+            "DOM.Iterable"
+        ]
+    },
+    "include": [
+        "src/**/*"
+    ],
+    "exclude": [
+        "dist"
+    ]
+}
