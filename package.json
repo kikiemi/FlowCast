@@ -19,7 +19,7 @@
         "check": "tsc --noEmit",
         "verify": "npm run verify:audio && npm run verify:media",
         "verify:audio": "node test/verify-mp2.mjs && node test/verify-mp3.mjs && node test/verify-mpeg-decode.mjs && node test/verify-flac-enc.mjs && node test/verify-aac-enc.mjs",
-        "verify:media": "node test/verify-mux.mjs && node test/verify-gif.mjs",
+        "verify:media": "node test/verify-mux.mjs && node test/verify-gif.mjs && node test/verify-avsync.mjs",
         "bench:mp3": "node test/bench-mp3.mjs"
     },
     "license": "WTFPL",

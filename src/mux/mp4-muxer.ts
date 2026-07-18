@@ -68,24 +68,62 @@ interface TrackTiming {
     readonly decodeDurations: number[];
     readonly compositionOffsets: number[];
     readonly durationUnits: number;
+    /** Earliest presentation time of the track, in seconds. */
+    readonly startSeconds: number;
+    /** Earliest presentation minus first decode time, in track units (>= 0). */
+    readonly mediaTimeUnits: number;
 }
 
+/**
+ * Sample durations are anchored to the chunk timestamps: each duration is the
+ * integer-timescale difference between consecutive decode times, so rounding
+ * never accumulates and variable frame rates survive intact. The old
+ * per-chunk `duration` field is only used for the final sample.
+ */
 function readChunkTiming(chunks: EncodedChunk[], timescale: number): TrackTiming {
+    const count = chunks.length;
     const decodeDurations: number[] = [];
     const compositionOffsets: number[] = [];
-    let durationUnits = 0;
-
-    for (const chunk of chunks) {
-        const ctoSeconds = chunk.compositionTimeOffset
-            ?? (chunk.decodeTimestamp !== undefined ? chunk.timestamp - chunk.decodeTimestamp : 0);
-        const duration = Math.max(1, toUint32Seconds(chunk.duration, timescale));
-        const cto = Math.round(ctoSeconds * timescale);
-        decodeDurations.push(duration);
-        compositionOffsets.push(cto);
-        durationUnits += duration;
+    if (count === 0) {
+        return { decodeDurations, compositionOffsets, durationUnits: 0, startSeconds: 0, mediaTimeUnits: 0 };
     }
 
-    return { decodeDurations, compositionOffsets, durationUnits };
+    const firstDecode = chunks[0].decodeTimestamp ?? chunks[0].timestamp;
+    const decodeUnits = new Array<number>(count);
+    for (let i = 0; i < count; i++) {
+        const dts = chunks[i].decodeTimestamp ?? chunks[i].timestamp;
+        decodeUnits[i] = Math.round((dts - firstDecode) * timescale);
+    }
+
+    let durationUnits = 0;
+    let debt = 0;
+    let startSeconds = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < count; i++) {
+        let duration = i + 1 < count
+            ? decodeUnits[i + 1] - decodeUnits[i]
+            : Math.max(1, toUint32Seconds(chunks[i].duration, timescale));
+        duration -= debt;
+        debt = 0;
+        if (duration < 1) {
+            debt = 1 - duration;
+            duration = 1;
+        }
+        decodeDurations.push(duration);
+        durationUnits += duration;
+
+        const explicitCto = chunks[i].compositionTimeOffset;
+        const ctoUnits = explicitCto !== undefined
+            ? Math.round(explicitCto * timescale)
+            : chunks[i].decodeTimestamp !== undefined
+                ? Math.round((chunks[i].timestamp - firstDecode) * timescale) - decodeUnits[i]
+                : 0;
+        compositionOffsets.push(ctoUnits);
+        const presentation = chunks[i].timestamp;
+        if (presentation < startSeconds) startSeconds = presentation;
+    }
+
+    const mediaTimeUnits = Math.max(0, Math.round((startSeconds - firstDecode) * timescale));
+    return { decodeDurations, compositionOffsets, durationUnits, startSeconds, mediaTimeUnits };
 }
 
 export class MP4Muxer {
@@ -209,14 +247,23 @@ export class MP4Muxer {
         const audioTiming = hasA ? readChunkTiming(this.audioChunks, audioTimescale) : null;
         const videoMovieDuration = videoTiming ? Math.round(videoTiming.durationUnits / videoTimescale * movieTimescale) : 0;
         const audioMovieDuration = audioTiming ? Math.round(audioTiming.durationUnits / audioTimescale * movieTimescale) : 0;
-        const movieDuration = Math.max(videoMovieDuration, audioMovieDuration);
+
+        // Preserve the source's inter-track start offset: the earlier track
+        // anchors the movie, the later one gets an empty leading edit.
+        const baseStart = Math.min(
+            videoTiming ? videoTiming.startSeconds : Number.POSITIVE_INFINITY,
+            audioTiming ? audioTiming.startSeconds : Number.POSITIVE_INFINITY,
+        );
+        const videoLead = videoTiming ? Math.max(0, Math.round((videoTiming.startSeconds - baseStart) * movieTimescale)) : 0;
+        const audioLead = audioTiming ? Math.max(0, Math.round((audioTiming.startSeconds - baseStart) * movieTimescale)) : 0;
+        const movieDuration = Math.max(videoLead + videoMovieDuration, audioLead + audioMovieDuration);
 
         const traks: Uint8Array[] = [];
         if (hasV) {
-            traks.push(this.buildTrak(1, true, this.videoChunks, videoOffsets, base, videoTimescale, videoTiming!, videoMovieDuration));
+            traks.push(this.buildTrak(1, true, this.videoChunks, videoOffsets, base, videoTimescale, videoTiming!, videoMovieDuration, videoLead));
         }
         if (hasA) {
-            traks.push(this.buildTrak(hasV ? 2 : 1, false, this.audioChunks, audioOffsets, base, audioTimescale, audioTiming!, audioMovieDuration));
+            traks.push(this.buildTrak(hasV ? 2 : 1, false, this.audioChunks, audioOffsets, base, audioTimescale, audioTiming!, audioMovieDuration, audioLead));
         }
         return box('moov', this.buildMvhd(movieTimescale, movieDuration, traks.length + 1), ...traks);
     }
@@ -244,11 +291,38 @@ export class MP4Muxer {
         trackTimescale: number,
         timing: TrackTiming,
         movieDuration: number,
+        leadMovieUnits: number,
     ): Uint8Array {
-        const tkhd = this.buildTkhd(id, isVideo, movieDuration);
+        const tkhd = this.buildTkhd(id, isVideo, leadMovieUnits + movieDuration);
         const mdhd = this.buildMdhd(trackTimescale, timing.durationUnits);
         const minf = this.buildMinf(isVideo, chunks, offsets, base, timing);
-        return box('trak', tkhd, box('mdia', mdhd, this.buildHdlr(isVideo), minf));
+        const mdia = box('mdia', mdhd, this.buildHdlr(isVideo), minf);
+        if (leadMovieUnits > 0 || timing.mediaTimeUnits > 0) {
+            return box('trak', tkhd, this.buildEdts(leadMovieUnits, movieDuration, timing.mediaTimeUnits), mdia);
+        }
+        return box('trak', tkhd, mdia);
+    }
+
+    /**
+     * Edit list: an optional empty edit delays the track, then the media
+     * plays from media_time (trimming the decoder lead-in of B-frame video).
+     */
+    private buildEdts(leadMovieUnits: number, movieDuration: number, mediaTimeUnits: number): Uint8Array {
+        const entryCount = leadMovieUnits > 0 ? 2 : 1;
+        const payload = new Uint8Array(4 + entryCount * 12);
+        const dv = new DataView(payload.buffer);
+        dv.setUint32(0, entryCount, false);
+        let p = 4;
+        if (leadMovieUnits > 0) {
+            dv.setUint32(p, leadMovieUnits, false);
+            dv.setInt32(p + 4, -1, false); // media_time -1: empty edit
+            dv.setUint32(p + 8, 0x00010000, false);
+            p += 12;
+        }
+        dv.setUint32(p, movieDuration, false);
+        dv.setInt32(p + 4, mediaTimeUnits, false);
+        dv.setUint32(p + 8, 0x00010000, false);
+        return box('edts', fullBox('elst', 0, 0, payload));
     }
 
     private buildTkhd(id: number, isVideo: boolean, duration: number): Uint8Array {
@@ -279,10 +353,11 @@ export class MP4Muxer {
     }
 
     private buildHdlr(isVideo: boolean): Uint8Array {
+        // fullbox payload: pre_defined(4) + handler_type(4) + reserved(12) + name
         const name = isVideo ? 'VideoHandler\0' : 'SoundHandler\0';
-        const payload = new Uint8Array(24 + name.length);
-        payload.set(ascii(isVideo ? 'vide' : 'soun'), 8);
-        payload.set(ascii(name), 24);
+        const payload = new Uint8Array(20 + name.length);
+        payload.set(ascii(isVideo ? 'vide' : 'soun'), 4);
+        payload.set(ascii(name), 20);
         return fullBox('hdlr', 0, 0, payload);
     }
 

@@ -89,6 +89,11 @@ export class TSDemuxer {
         let curVideoChunks: Uint8Array[] = [];
         let curVideoSize = 0;
         let curVideoPts = 0;
+        let lastVideoPts = -1;
+        let lastAudioPts = -1;
+        let wrapBase = 0;
+        const PTS_WRAP = 2 ** 33;
+        const PTS_HALF_RANGE = 2 ** 32;
         let curAudioChunks: Uint8Array[] = [];
         let curAudioSize = 0;
         let curAudioPts = 0;
@@ -140,6 +145,17 @@ export class TSDemuxer {
                     let pts = 0;
                     if (ptsFlag && payload.length >= 14) {
                         pts = this.readPTS(payload, 9);
+                        // 33-bit PTS wraps every ~26.5 h; unwrap against the last seen value.
+                        const last = pid === videoPid ? lastVideoPts : lastAudioPts;
+                        if (last >= 0) {
+                            let unwrapped = pts + wrapBase;
+                            while (unwrapped < last - PTS_HALF_RANGE) unwrapped += PTS_WRAP;
+                            if (unwrapped - wrapBase !== pts) wrapBase = unwrapped - pts;
+                            pts = unwrapped;
+                        } else {
+                            pts += wrapBase;
+                        }
+                        if (pid === videoPid) lastVideoPts = pts; else lastAudioPts = pts;
                     }
                     const dataStart = 9 + pesHdrLen;
                     if (dataStart < payload.length) {

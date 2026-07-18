@@ -79,6 +79,12 @@ export class MP4Demuxer {
 
         const dv = new DataView(moovBuf.buffer, moovBuf.byteOffset, moovBuf.byteLength);
         const result: MP4DemuxResult = { videoTracks: [], audioTracks: [] };
+        const mvhd = findBox(moovBuf, 8, moovBuf.length, 'mvhd');
+        let movieTimescale = 1000;
+        if (mvhd) {
+            const mvhdVer = moovBuf[mvhd.offset + 8];
+            movieTimescale = readU32(dv, mvhd.offset + (mvhdVer === 0 ? 20 : 28));
+        }
         const traks = findBoxes(moovBuf, 8, moovBuf.length).filter(b => b.type === 'trak');
 
         // Track ID → track index mapping for fragments
@@ -88,7 +94,7 @@ export class MP4Demuxer {
         for (const trak of traks) {
             try {
                 const trackId = this.getTrackId(moovBuf, dv, trak);
-                this.parseTrak(moovBuf, dv, trak, result);
+                this.parseTrak(moovBuf, dv, trak, result, movieTimescale);
 
                 if (trackId > 0) {
                     if (result.videoTracks.length > prevVCount) {
@@ -330,7 +336,7 @@ export class MP4Demuxer {
         return null;
     }
 
-    private parseTrak(buf: Uint8Array, dv: DataView, trak: Box, result: MP4DemuxResult): void {
+    private parseTrak(buf: Uint8Array, dv: DataView, trak: Box, result: MP4DemuxResult, movieTimescale: number): void {
         const trakS = trak.offset + 8;
         const trakE = trak.offset + trak.size;
 
@@ -360,6 +366,42 @@ export class MP4Demuxer {
                 const hi = readU32(dv, mdhd.offset + 32);
                 const lo = readU32(dv, mdhd.offset + 36);
                 mediaDuration = hi * 0x100000000 + lo;
+            }
+        }
+
+        // Edit list: an initial empty edit delays presentation; the first
+        // normal edit's media_time trims the encoder lead-in. Both shift every
+        // sample timestamp; dropping them desynchronizes A/V on B-frame
+        // sources (x264 emits media_time = decoder delay).
+        let editShiftSeconds = 0;
+        const edts = findBox(buf, trakS, trakE, 'edts');
+        if (edts) {
+            const elst = findBox(buf, edts.offset + 8, edts.offset + edts.size, 'elst');
+            if (elst) {
+                const elstVer = buf[elst.offset + 8];
+                const entryCount = readU32(dv, elst.offset + 12);
+                let p = elst.offset + 16;
+                for (let i = 0; i < entryCount; i++) {
+                    let segmentDuration: number;
+                    let mediaTime: number;
+                    if (elstVer === 1) {
+                        segmentDuration = readU32(dv, p) * 0x100000000 + readU32(dv, p + 4);
+                        const hi = dv.getInt32(p + 8, false);
+                        const lo = readU32(dv, p + 12);
+                        mediaTime = hi * 0x100000000 + lo;
+                        p += 20;
+                    } else {
+                        segmentDuration = readU32(dv, p);
+                        mediaTime = dv.getInt32(p + 4, false);
+                        p += 12;
+                    }
+                    if (mediaTime === -1) {
+                        editShiftSeconds += segmentDuration / movieTimescale;
+                    } else {
+                        editShiftSeconds -= mediaTime / timescale;
+                        break;
+                    }
+                }
             }
         }
 
@@ -499,7 +541,7 @@ export class MP4Demuxer {
             }
         }
 
-        const samples = this.parseSamples(buf, dv, stblS, stblE, timescale);
+        const samples = this.parseSamples(buf, dv, stblS, stblE, timescale, editShiftSeconds);
         const trackDuration = timescale > 0 ? mediaDuration / timescale : 0;
 
         const track: MP4TrackInfo = {
@@ -577,6 +619,7 @@ export class MP4Demuxer {
 
     private parseSamples(
         buf: Uint8Array, dv: DataView, stblS: number, stblE: number, timescale: number,
+        editShiftSeconds = 0,
     ): MP4Sample[] {
         const stsz = findBox(buf, stblS, stblE, 'stsz');
         const stco = findBox(buf, stblS, stblE, 'stco') ?? findBox(buf, stblS, stblE, 'co64');
@@ -683,8 +726,8 @@ export class MP4Demuxer {
             samples.push({
                 offset: sampleOffsets[i] ?? 0,
                 size: sizes[i] ?? 0,
-                timestamp: (decodeTs + cto) / timescale,
-                decodeTimestamp: decodeTs / timescale,
+                timestamp: (decodeTs + cto) / timescale + editShiftSeconds,
+                decodeTimestamp: decodeTs / timescale + editShiftSeconds,
                 compositionTimeOffset: cto / timescale,
                 duration: dur / timescale,
                 isKeyframe: keyframes.has(i),
